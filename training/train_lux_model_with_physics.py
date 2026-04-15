@@ -1,41 +1,145 @@
 import argparse
 from pathlib import Path
+import os
+
 import torch
 import torch.nn as nn
-import torchvision.models as models
-import torchvision.transforms as transforms
-from PIL import Image
+import torch.optim as optim
+import pandas as pd
 import numpy as np
+from PIL import Image
 
-BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "lux_model_physics.pth"
-DEFAULT_IMAGE_PATH = PROJECT_ROOT / "data" / "sample" / "images"
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import torchvision.models as models
 
 # =========================
-# CAMERA PARAMETERS (SAME AS TRAINING)
+# CAMERA PARAMETERS
 # =========================
 F_NUMBER = 1.9
 SHUTTER = 1 / 60
 EXPOSURE_FACTOR = SHUTTER / (F_NUMBER ** 2)
 
+# =========================
+# PATH HANDLING (GITHUB SAFE)
+# =========================
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
 
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "sample"
+DEFAULT_SAVE_PATH = PROJECT_ROOT / "src" / "models" / "lux_model_physics.pth"
+
+# =========================
+# ARGUMENTS
+# =========================
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--save_path", type=Path, default=DEFAULT_SAVE_PATH)
+    return parser.parse_args()
+
+# =========================
+# POLYGON → BBOX
+# =========================
+def get_bbox(label_path, w, h):
+    try:
+        if not label_path.exists():
+            return None
+
+        with open(label_path, "r") as f:
+            lines = f.readlines()
+
+        if len(lines) == 0:
+            return None
+
+        parts = list(map(float, lines[0].split()))
+        coords = parts[1:]
+
+        xs = coords[0::2]
+        ys = coords[1::2]
+
+        xmin = int(min(xs) * w)
+        xmax = int(max(xs) * w)
+        ymin = int(min(ys) * h)
+        ymax = int(max(ys) * h)
+
+        return xmin, ymin, xmax, ymax
+    except:
+        return None
+
+# =========================
+# DATASET
+# =========================
+class LuxDataset(Dataset):
+    def __init__(self, data_dir, transform=None):
+        self.img_dir = data_dir / "images"
+        self.label_dir = data_dir / "labels"
+        self.csv_path = data_dir / "lux_labels.csv"
+
+        self.df = pd.read_csv(self.csv_path)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        img_path = self.img_dir / row["image"]
+        label_path = self.label_dir / (Path(row["image"]).stem + ".txt")
+
+        image = Image.open(img_path).convert("RGB")
+        w, h = image.size
+
+        bbox = get_bbox(label_path, w, h)
+
+        # fallback if no label
+        if bbox is None:
+            crop = image
+        else:
+            xmin, ymin, xmax, ymax = bbox
+            if xmin >= xmax or ymin >= ymax:
+                crop = image
+            else:
+                crop = image.crop((xmin, ymin, xmax, ymax))
+
+        # =========================
+        # BRIGHTNESS FEATURE
+        # =========================
+        gray = np.array(crop.convert("L"), dtype=np.float32)
+        mean_intensity = gray.mean() / 255.0
+        normalized_brightness = mean_intensity / EXPOSURE_FACTOR
+
+        brightness = torch.tensor([normalized_brightness], dtype=torch.float32)
+
+        if self.transform:
+            crop = self.transform(crop)
+
+        lux = torch.tensor(row["lux"], dtype=torch.float32)
+
+        return crop, brightness, lux
+
+# =========================
+# MODEL
+# =========================
 class LuxModel(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.cnn = models.resnet18(weights=None)
+        self.cnn = models.resnet18(weights="IMAGENET1K_V1")
         self.cnn.fc = nn.Identity()
 
         self.brightness_fc = nn.Sequential(
             nn.Linear(1, 16),
-            nn.ReLU(),
+            nn.ReLU()
         )
 
         self.final = nn.Sequential(
             nn.Linear(512 + 16, 128),
             nn.ReLU(),
-            nn.Linear(128, 1),
+            nn.Linear(128, 1)
         )
 
     def forward(self, img, brightness):
@@ -44,77 +148,61 @@ class LuxModel(nn.Module):
         combined = torch.cat([img_feat, bright_feat], dim=1)
         return self.final(combined)
 
+# =========================
+# MAIN TRAINING
+# =========================
+def main():
+    args = parse_args()
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Load the physics-informed lux model and run a single example prediction."
-    )
-    parser.add_argument(
-        "--model-path",
-        type=Path,
-        default=DEFAULT_MODEL_PATH,
-        help="Path to the saved lux model weights.",
-    )
-    parser.add_argument(
-        "--image-path",
-        type=Path,
-        default=None,
-        help="Path to a test image. If omitted, the first sample image is used.",
-    )
-    return parser.parse_args()
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
 
+    dataset = LuxDataset(args.data_dir, transform)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-def load_model(model_path: Path, device: torch.device):
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model weights not found: {model_path}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = LuxModel().to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-    return model
+    criterion = nn.L1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
+    # =========================
+    # TRAIN LOOP
+    # =========================
+    for epoch in range(args.epochs):
+        model.train()
+        total_loss = 0
 
-def predict_lux(image_path: Path, model, device):
-    image = Image.open(image_path).convert("RGB")
+        for imgs, brightness, lux in loader:
+            imgs = imgs.to(device)
+            brightness = brightness.to(device)
+            lux = lux.to(device).unsqueeze(1)
 
-    gray = np.array(image.convert("L"), dtype=np.float32)
-    mean_intensity = gray.mean() / 255.0
-    normalized_brightness = mean_intensity / EXPOSURE_FACTOR
+            preds = model(imgs, brightness)
 
-    brightness_tensor = torch.tensor([[normalized_brightness]], dtype=torch.float32).to(device)
-    img_tensor = transform(image).unsqueeze(0).to(device)
+            loss = criterion(preds, lux)
 
-    with torch.no_grad():
-        pred = model(img_tensor, brightness_tensor)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-    return pred.item()
+            total_loss += loss.item()
 
+        avg_loss = total_loss / len(loader)
+        print(f"Epoch [{epoch+1}/{args.epochs}] | MAE: {avg_loss:.2f} lux")
 
-def find_default_image() -> Path:
-    if not DEFAULT_IMAGE_PATH.exists():
-        raise FileNotFoundError(
-            f"Default sample image directory not found: {DEFAULT_IMAGE_PATH}."
-        )
+    # =========================
+    # SAVE
+    # =========================
+    args.save_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), args.save_path)
 
-    images = sorted(
-        [p for p in DEFAULT_IMAGE_PATH.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"}]
-    )
-    if not images:
-        raise FileNotFoundError(f"No sample images found in {DEFAULT_IMAGE_PATH}.")
-    return images[0]
+    print(f"✅ Model saved to {args.save_path}")
 
-
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
-
-
+# =========================
+# ENTRY POINT
+# =========================
 if __name__ == "__main__":
-    args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(args.model_path, device)
-
-    image_path = args.image_path or find_default_image()
-    lux = predict_lux(image_path, model, device)
-    print(f"Predicted Lux for {image_path}: {lux:.2f}")
+    main()

@@ -9,7 +9,7 @@ from PIL import Image
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "lux_model_physics.pth"
+DEFAULT_MODEL_PATH = PROJECT_ROOT /"models"/ "lux_model_physics.pth"
 DEFAULT_SAMPLE_IMAGES = PROJECT_ROOT / "data" / "sample" / "images"
 DEFAULT_SAMPLE_LABELS = PROJECT_ROOT / "data" / "sample" / "labels"
 
