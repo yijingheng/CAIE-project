@@ -9,18 +9,6 @@ OLLAMA_MODEL = "llama2:latest"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_TIMEOUT = 120  # seconds
 
-COLOR_RESULT_MAP = {
-    "green": "PASS",
-    "red": "FAIL",
-    "blue": "PROCESSING",
-}
-
-COLOR_REASON_MAP = {
-    "green": "Green indicates healthy system status.",
-    "red": "Red indicates error or failure condition.",
-    "blue": "Blue indicates initialization or processing state.",
-}
-
 
 def _extract_formatted_response(raw_text: str, expected_result: str) -> str:
     text = (raw_text or "").strip()
@@ -78,13 +66,13 @@ def _extract_result_from_response(raw_text: str) -> str:
     
     # Fallback: search for any valid result keyword in the response
     upper_text = text.upper()
-    for result in valid_results:
+    for result in sorted(valid_results, key=lambda x: -len(x)):  # Check longer words first
         if result in upper_text:
             print(f"🔍 [DEBUG] Found result keyword: {result}")
             return result
     
     # If nothing found, return UNKNOWN
-    print(f"🔍 [DEBUG] No result found, returning UNKNOWN")
+    print(f"🔍 [DEBUG] No result found in response. Text was: {text}")
     return "UNKNOWN"
 
 # =========================
@@ -118,7 +106,7 @@ def check_ollama_connection():
 def generate_text(prompt: str) -> str:
     """Generate text using Ollama API."""
     
-    system_prompt = "You are a precise industrial LED inspection assistant."
+    system_prompt = "You are a precise industrial LED inspection assistant. Always follow the format instructions exactly. Answer only with the requested format, nothing else."
     full_prompt = f"{system_prompt}\n\n{prompt}"
     
     payload = {
@@ -126,10 +114,11 @@ def generate_text(prompt: str) -> str:
         "prompt": full_prompt,
         "stream": False,
         "options": {
-            "temperature": 0.1,  # 🔥 Deterministic output
-            "top_p": 0.95,
-            "num_predict": 50,  # Equivalent to max_new_tokens
-            "top_k": 40,
+            "temperature": 0.1,  # 🔥 Low temperature for consistent output
+            "top_p": 0.9,        # Narrower sampling for focus
+            "num_predict": 100,  # More room for structured output
+            "top_k": 20,         # Reduced from 40 for more deterministic output
+            "repeat_penalty": 1.2,  # Avoid repetition
         }
     }
     
@@ -166,32 +155,44 @@ def generate_text(prompt: str) -> str:
 # =========================
 def interpret_led(color: str, lux: float) -> str:
     # =========================
-    # LLM INTERPRETS ALL DATA
+    # LLM INTERPRETS SENSOR DATA
     # =========================
     color = color.lower()
 
     # =========================
-    # SIMPLIFIED PROMPT WITH EXAMPLES
+    # FLEXIBLE PROMPT - LET LLM DECIDE BASED ON SENSOR DATA
     # =========================
     prompt = (
-        "You are an LED inspection system. Answer with exactly this format:\n"
+        "You are an LED inspection system analyzing live sensor data.\n"
+        "YOUR TASK: Based on the LED color AND brightness value, determine the system status.\n\n"
+        "INTERPRETATION GUIDELINES:\n"
+        "- Green LED: Usually indicates healthy status, but very low lux (< 50) may suggest hardware issue\n"
+        "- Red LED: Usually indicates error, but analyze the lux context for severity\n"
+        "- Blue LED: Usually indicates processing/initialization state\n"
+        "- Consider both color AND lux together for your analysis\n"
+        "- Make your own judgment - don't just follow color blindly\n\n"
+        "RESPONSE FORMAT (exactly 2 lines, no deviation):\n"
         "Result: <PASS, FAIL, PROCESSING, or UNKNOWN>\n"
-        "Explanation: <short sentence>\n\n"
-        "Important: If the LED color is green, the result must be PASS.\n"
-        "If the LED color is red, the result must be FAIL.\n"
-        "If the LED color is blue, the result must be PROCESSING.\n"
-        "Do not contradict the LED color.\n\n"
-        "Examples:\n"
-        "Input: green LED, 500 lux\n"
+        "Explanation: <one sentence analyzing color + lux context>\n\n"
+        "EXAMPLES (study the reasoning):\n"
+        "Sensor Input: LED=GREEN, Lux=750.5\n"
         "Result: PASS\n"
-        "Explanation: System healthy and operating normally.\n\n"
-        "Input: red LED, 100 lux\n"
+        "Explanation: Green LED at 750.5 lux indicates healthy system operating at normal brightness.\n\n"
+        "Sensor Input: LED=GREEN, Lux=25.0\n"
         "Result: FAIL\n"
-        "Explanation: System error detected.\n\n"
-        "Input: blue LED, 300 lux\n"
+        "Explanation: Green LED but critically low brightness (25 lux) suggests hardware malfunction.\n\n"
+        "Sensor Input: LED=RED, Lux=200.0\n"
+        "Result: FAIL\n"
+        "Explanation: Red LED at 200 lux indicates system error with moderate brightness loss.\n\n"
+        "Sensor Input: LED=BLUE, Lux=350.0\n"
         "Result: PROCESSING\n"
-        "Explanation: System initializing.\n\n"
-        f"Input: {color} LED, {lux:.1f} lux\n"
+        "Explanation: Blue LED at 350 lux shows system is initializing or performing diagnostics.\n\n"
+        "NOW ANALYZE THIS ACTUAL SENSOR DATA:\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"LED Color: {color.upper()}\n"
+        f"Brightness (Lux): {lux:.2f}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Provide your analysis:\n"
     )
 
     print(f"🧠 Calling Ollama to interpret: color={color}, lux={lux}...")
@@ -201,14 +202,7 @@ def interpret_led(color: str, lux: float) -> str:
     # Extract result from LLM response
     extracted_result = _extract_result_from_response(raw_response)
     print(f"🔍 [DEBUG] Extracted result: {extracted_result}")
-
-    # Enforce the expected result for known LED colors
-    if color in COLOR_RESULT_MAP:
-        expected_result = COLOR_RESULT_MAP[color]
-        if extracted_result != expected_result:
-            print(f"🔍 [DEBUG] Overriding {extracted_result} -> {expected_result} for color {color}")
-            return f"Result: {expected_result}\nExplanation: {COLOR_REASON_MAP[color]}"
-
+    
     response = _extract_formatted_response(raw_response, extracted_result)
     print(f"🔍 [DEBUG] Formatted response: {repr(response)}")
     return response
@@ -232,27 +226,37 @@ def interpret_result(result: str, color: str, lux: float, context: str = None) -
     """
     color = color.lower()
     
-    # Build simplified prompt with examples
+    # Build flexible prompt to let LLM provide context-aware analysis
     prompt = (
-        "You are an LED inspection system. Answer with exactly this format:\n"
-        "Result: <PASS, FAIL, PROCESSING, or UNKNOWN>\n"
-        "Explanation: <short sentence>\n\n"
-        "Examples:\n"
-        "Input: Result PASS, green LED, 500 lux\n"
+        "You are an LED inspection system analyzing live sensor data.\n"
+        "YOUR TASK: Based on the result status, LED color, and brightness value, provide context-aware explanation.\n\n"
+        "RESPONSE FORMAT (exactly 2 lines, no deviation):\n"
+        "Result: <restate the result>\n"
+        "Explanation: <one sentence analyzing what the sensor combination means>\n\n"
+        "EXAMPLES (note how color + lux context matters):\n"
+        "Sensor Data: Result=PASS, LED=GREEN, Lux=750.5\n"
         "Result: PASS\n"
-        "Explanation: System healthy and operating normally.\n\n"
-        "Input: Result FAIL, red LED, 100 lux\n"
+        "Explanation: Green LED at 750.5 lux confirms system is healthy and operating at full brightness.\n\n"
+        "Sensor Data: Result=FAIL, LED=RED, Lux=45.2\n"
         "Result: FAIL\n"
-        "Explanation: System error detected.\n\n"
-        "Input: Result PROCESSING, blue LED, 300 lux\n"
+        "Explanation: Red LED with critically low brightness (45.2 lux) indicates severe system failure.\n\n"
+        "Sensor Data: Result=PROCESSING, LED=BLUE, Lux=320.8\n"
         "Result: PROCESSING\n"
-        "Explanation: System initializing.\n\n"
+        "Explanation: Blue LED at 320.8 lux shows system is in active initialization or diagnostic mode.\n\n"
+        "NOW ANALYZE THIS SENSOR RESULT:\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Result: {result}\n"
+        f"LED Color: {color.upper()}\n"
+        f"Brightness (Lux): {lux:.2f}\n"
     )
     
     if context:
-        prompt += f"Input: Result {result}, {color} LED, {lux:.1f} lux, context: {context}\n"
-    else:
-        prompt += f"Input: Result {result}, {color} LED, {lux:.1f} lux\n"
+        prompt += f"Additional Context: {context}\n"
+    
+    prompt += (
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Provide your interpretation:\n"
+    )
     
     print(f"🧠 Calling Ollama to interpret result: {result} (color={color}, lux={lux})...")
     raw_response = generate_text(prompt)
